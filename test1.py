@@ -1,153 +1,139 @@
-from langchain.agents import AgentExecutor, Tool
-from langchain.chat_models import ChatOpenAI
-from langchain.prompts import ChatPromptTemplate
-from langchain.output_parsers import PydanticOutputParser
-from pydantic import BaseModel, Field
-from typing import List
-import agentops
-from zapier_integration import ZapierEmailTrigger, ZapierEmailSender
+from typing import Dict, List
+from pydantic import BaseModel
+from langchain.agents import initialize_agent, Tool
+from langchain_openai import ChatOpenAI
+from langchain.prompts import PromptTemplate
+from langchain.memory import ConversationBufferMemory
+import os
+from fastapi import FastAPI, Request
+import uvicorn
+import requests
+import json
+import logging
 
-# Define output schemas
-class EmailAnalysis(BaseModel):
-    is_visa_related: bool = Field(description="Whether the email is related to visa application")
-    confidence_score: float = Field(description="Confidence score of the classification")
+app = FastAPI()
 
-class ApplicationInfo(BaseModel):
-    university: str = Field(description="University name")
-    salary: float = Field(description="Annual salary")
-    job_title: str = Field(description="Job title")
-    visa_type: str = Field(description="Type of visa")
-    missing_fields: List[str] = Field(description="List of missing required fields")
+# Initialize OpenAI LLM
+llm = ChatOpenAI(temperature=0)
 
 # Email Analysis Agent
-class AnalyzeEmailAgent:
-    def __init__(self):
-        self.llm = ChatOpenAI(temperature=0)
-        self.parser = PydanticOutputParser(pydantic_object=EmailAnalysis)
-        
-        self.prompt = ChatPromptTemplate.from_template("""
-            Analyze the following email and determine if it's related to a visa application.
-            Consider mentions of visa, immigration, work permits, or related terms.
-            
-            Email content: {email_content}
-            
-            {format_instructions}
-        """)
+email_analysis_prompt = PromptTemplate(
+    input_variables=["email_content"],
+    template="""
+    Analyze the following email and determine if it's related to a visa application:
+    
+    {email_content}
+    
+    Is this a visa application related email? Return JSON with format:
+    {{"is_visa_related": boolean, "explanation": "string"}}
+    """
+)
 
-    @agentops.track
-    async def analyze(self, email_content: str) -> EmailAnalysis:
-        messages = self.prompt.format_messages(
-            email_content=email_content,
-            format_instructions=self.parser.get_format_instructions()
-        )
-        response = await self.llm.apredict_messages(messages)
-        return self.parser.parse(response.content)
-
-    async def send_redirect_email(self, to_email: str):
-        email_content = """
-        Dear Sir/Madam,
-        
-        Thank you for your email. This appears to not be related to visa application.
-        I'll direct you to our manager who will assist you further.
-        
-        Best regards,
-        Visa Application Team
-        """
-        await ZapierEmailSender.send_email(to_email, "Re: Your Inquiry", email_content)
+email_analysis_chain = llm|email_analysis_prompt
 
 # Information Extraction Agent
-class ExtractInformationAgent:
-    def __init__(self):
-        self.llm = ChatOpenAI(temperature=0)
-        self.parser = PydanticOutputParser(pydantic_object=ApplicationInfo)
-        
-        self.prompt = ChatPromptTemplate.from_template("""
-            Extract the following information from the email:
-            - University name
-            - Annual salary
-            - Job title
-            - Type of visa requested
-            
-            Mark any missing fields.
-            
-            Email content: {email_content}
-            
-            {format_instructions}
-        """)
-
-    @agentops.track
-    async def extract(self, email_content: str) -> ApplicationInfo:
-        messages = self.prompt.format_messages(
-            email_content=email_content,
-            format_instructions=self.parser.get_format_instructions()
-        )
-        response = await self.llm.apredict_messages(messages)
-        return self.parser.parse(response.content)
-
-    async def send_status_email(self, to_email: str, info: ApplicationInfo):
-        if not info.missing_fields:
-            email_content = """
-            Dear Sir/Madam,
-            
-            Thank you for providing your information. We have received all required details
-            for your visa application.
-            
-            Best regards,
-            Visa Application Team
-            """
-        else:
-            missing_fields_str = "\n".join([f"- {field}" for field in info.missing_fields])
-            email_content = f"""
-            Dear Sir/Madam,
-            
-            Thank you for your visa application. However, we notice some required information
-            is missing. Please provide the following details:
-            
-            {missing_fields_str}
-            
-            Best regards,
-            Visa Application Team
-            """
-        
-        await ZapierEmailSender.send_email(to_email, "Re: Visa Application Status", email_content)
-
-# Main Orchestrator
-class VisaApplicationOrchestrator:
-    def __init__(self):
-        self.analyze_agent = AnalyzeEmailAgent()
-        self.extract_agent = ExtractInformationAgent()
-        
-    async def process_email(self, email_data: dict):
-        email_content = email_data['body']
-        sender_email = email_data['from']
-        
-        # Track the process with AgentOps
-        with agentops.context({"email_id": email_data['id']}):
-            # Analyze email
-            analysis = await self.analyze_agent.analyze(email_content)
-            
-            if not analysis.is_visa_related:
-                await self.analyze_agent.send_redirect_email(sender_email)
-                return
-            
-            # Extract information
-            info = await self.extract_agent.extract(email_content)
-            await self.extract_agent.send_status_email(sender_email, info)
-
-# Zapier Integration
-def setup_zapier_trigger():
-    """Set up Zapier trigger for new emails"""
-    trigger = ZapierEmailTrigger(
-        on_new_email=lambda email_data: asyncio.run(
-            VisaApplicationOrchestrator().process_email(email_data)
-        )
-    )
-    return trigger
-
-# Usage
-if __name__ == "__main__":
-    # Set up the Zapier trigger
-    email_trigger = setup_zapier_trigger()
+info_extraction_prompt = PromptTemplate(
+    input_variables=["email_content"],
+    template="""
+    Extract the following information from the email:
     
-    # Start monitoring for emails
-    email_trigger.start()
+    {email_content}
+    
+    Return JSON with format:
+    {{
+        "university": "string or null",
+        "salary": "string or null",
+        "job_title": "string or null",
+        "visa_type": "string or null",
+        "missing_fields": ["list of missing required fields"]
+    }}
+    """
+)
+
+info_extraction_chain = llm|info_extraction_prompt
+
+
+# Email Response Generator
+response_generator_prompt = PromptTemplate(
+    input_variables=["is_visa_related", "missing_fields", "email_address"],
+    template="""
+    Generate an email response based on the following conditions:
+    
+    Is visa related: {is_visa_related}
+    Missing fields: {missing_fields}
+    Send to: {email_address}
+    
+    Generate a professional email response. If not visa related, direct to manager.
+    If visa related but missing fields, list the missing information needed.
+    If all information is present, confirm receipt.
+    
+    Return JSON with format:
+    {{"subject": "string", "body": "string"}}
+    """
+)
+
+response_generator_chain = llm|response_generator_prompt
+
+def send_email_response(to_email: str, subject: str, body: str):
+    try:
+        webhook_url = os.getenv("ZAPIER_EMAIL_WEBHOOK_URL")
+        if not webhook_url:
+            raise EnvironmentError("ZAPIER_EMAIL_WEBHOOK_URL environment variable is not set")
+        payload = {
+            "to_email": to_email,
+            "subject": subject,
+            "body": body
+        }
+        
+        response = requests.post(webhook_url, json=payload)
+        response.raise_for_status() 
+        return response.status_code == 200
+    except requests.RequestException as e:
+        print(f"Error sending email response: {e}")
+        return False
+
+@app.post("/process-email")
+async def process_email(request: Request):
+    logging.info("Received email processing request")
+    try:
+        data = await request.json()
+        email_content = data.get("email_content")
+        from_email = data.get("from_email")
+        
+        # Step 1: Analyze if email is visa related
+        analysis_result = email_analysis_chain.invoke(email_content)
+        analysis_data = json.loads(analysis_result)
+        
+        if not analysis_data["is_visa_related"]:
+            response = response_generator_chain.invoke({
+                "is_visa_related": False,
+                "missing_fields": [],
+                "email_address": from_email
+            })
+            response_data = json.loads(response)
+            send_email_response(from_email, response_data["subject"], response_data["body"])
+            return {"status": "completed", "action": "non_visa_response_sent"}
+        
+        # Step 2: Extract information
+        extraction_result = info_extraction_chain.invoke(email_content)
+        extraction_data = json.loads(extraction_result)
+        
+        response = response_generator_chain.invoke({
+            "is_visa_related": True,
+            "missing_fields": extraction_data["missing_fields"],
+            "email_address": from_email
+        })
+        response_data = json.loads(response)
+        send_email_response(from_email, response_data["subject"], response_data["body"])
+
+        return {
+            "status": "completed",
+            "action": "visa_response_sent",
+            "extracted_data": extraction_data
+        }
+    except Exception as e:
+        logging.error(f"Error processing email: {e}")
+        return {"status": "error", "message": str(e)}
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
